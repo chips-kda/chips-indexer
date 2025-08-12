@@ -1,5 +1,6 @@
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
+from bson import Decimal128  # Added import for Decimal128
 import os
 import sys
 import json
@@ -33,6 +34,26 @@ class DexOrderProcessor:
         self.order_updates = []
         self.trade_inserts = []
         self.batch_size = 100
+
+    def safe_decimal_to_float(self, value):
+        """Safely convert various decimal types to float"""
+        if isinstance(value, Decimal128):
+            return float(value.to_decimal())
+        elif isinstance(value, Decimal):
+            return float(value)
+        elif isinstance(value, (int, float)):
+            return float(value)
+        elif isinstance(value, str):
+            return float(value)
+        else:
+            # Try to convert directly as fallback
+            return float(value)
+
+    def normalize_pair(self, pair):
+        """Normalize pair format from cKDA/KDA to cKDA-KDA"""
+        if isinstance(pair, str):
+            return pair.replace('/', '-')
+        return pair
 
     def connect_to_mongodb(self):
         """Establish MongoDB connection"""
@@ -80,26 +101,29 @@ class DexOrderProcessor:
         if not isinstance(params, list):
             return False, f"Expected params to be a list, got {type(params)}"
         
-        if len(params) < 6:
-            return False, f"Expected at least 6 parameters for PLACE_ORDER [id, amount, price, is_ask, order_time, account], got {len(params)}"
+        if len(params) < 7:
+            return False, f"Expected at least 7 parameters for PLACE_ORDER [account, id, amount, price, is_ask, order_time, pair], got {len(params)}"
         
         try:
             # Validate parameter types
-            order_id = str(params[0])   # string
-            amount = float(params[1])   # decimal -> float
-            price = float(params[2])    # decimal -> float  
-            is_ask = bool(params[3])    # boolean
-            order_time = params[4]      # time object
-            account = str(params[5])    # account string
+            account = str(params[0])    # account string
+            order_id = str(params[1])   # string
+            amount = self.safe_decimal_to_float(params[2])   # decimal -> float
+            price = self.safe_decimal_to_float(params[3])    # decimal -> float
+            is_ask = bool(params[4])    # boolean
+            order_time = params[5]      # time object
+            pair = str(params[6])       # pair string
             
+            if not account:
+                return False, "Account cannot be empty"
             if not order_id:
                 return False, "Order ID cannot be empty"
             if amount <= 0:
                 return False, "Amount must be positive"
             if price <= 0:
                 return False, "Price must be positive"
-            if not account:
-                return False, "Account cannot be empty"
+            if not pair:
+                return False, "Pair cannot be empty"
                 
         except (ValueError, TypeError) as e:
             return False, f"Invalid parameter types: {e}"
@@ -111,26 +135,32 @@ class DexOrderProcessor:
         if not isinstance(params, list):
             return False, f"Expected params to be a list, got {type(params)}"
         
-        if len(params) < 6:
-            return False, f"Expected at least 6 parameters for MATCH_ORDER [id, amount, price, is_ask, order_time, account], got {len(params)}"
+        if len(params) < 8:
+            return False, f"Expected at least 8 parameters for MATCH_ORDER [maker, taker, id, amount, price, is_ask, order_time, pair], got {len(params)}"
         
         try:
             # Validate parameter types
-            order_id = str(params[0])   # string
-            amount = float(params[1])   # decimal -> float
-            price = float(params[2])    # decimal -> float  
-            is_ask = bool(params[3])    # boolean
-            order_time = params[4]      # time object
-            account = str(params[5])    # account string
+            maker = str(params[0])      # maker account string
+            taker = str(params[1])      # taker account string
+            order_id = str(params[2])   # string
+            amount = self.safe_decimal_to_float(params[3])   # decimal -> float
+            price = self.safe_decimal_to_float(params[4])    # decimal -> float
+            is_ask = bool(params[5])    # boolean
+            order_time = params[6]      # time object
+            pair = str(params[7])       # pair string
             
+            if not maker:
+                return False, "Maker account cannot be empty"
+            if not taker:
+                return False, "Taker account cannot be empty"
             if not order_id:
                 return False, "Order ID cannot be empty"
             if amount <= 0:
                 return False, "Amount must be positive"
             if price <= 0:
                 return False, "Price must be positive"
-            if not account:
-                return False, "Account cannot be empty"
+            if not pair:
+                return False, "Pair cannot be empty"
                 
         except (ValueError, TypeError) as e:
             return False, f"Invalid parameter types: {e}"
@@ -151,18 +181,20 @@ class DexOrderProcessor:
     def process_place_order_event(self, event_params, height, block_time=None, tx_id=None):
         """Process PLACE_ORDER event"""
         try:
-            order_id = str(event_params[0])
-            amount = float(event_params[1])
-            price = float(event_params[2])
-            is_ask = bool(event_params[3])
-            order_time = event_params[4]
-            account = str(event_params[5])
+            account = str(event_params[0])
+            order_id = str(event_params[1])
+            amount = self.safe_decimal_to_float(event_params[2])
+            price = self.safe_decimal_to_float(event_params[3])
+            is_ask = bool(event_params[4])
+            order_time = event_params[5]
+            pair = self.normalize_pair(str(event_params[6]))
             
             timestamp = self.extract_timestamp(order_time)
             
             order_data = {
                 "orderId": order_id,
                 "account": account,
+                "pair": pair,
                 "originalAmount": amount,
                 "amount": amount,  # Remaining amount
                 "filledAmount": 0.0,
@@ -193,7 +225,7 @@ class DexOrderProcessor:
                 'upsert': True
             })
             
-            logger.debug(f"Queued PLACE_ORDER update for order {order_id} - {order_data['orderType']} {amount} @ {price} by {account}")
+            logger.debug(f"Queued PLACE_ORDER update for order {order_id} - {pair} {order_data['orderType']} {amount} @ {price} by {account}")
             
         except Exception as e:
             logger.error(f"Error processing PLACE_ORDER event: {e}")
@@ -201,12 +233,14 @@ class DexOrderProcessor:
     def process_match_order_event(self, event_params, height, block_time=None, tx_id=None):
         """Process MATCH_ORDER event"""
         try:
-            order_id = str(event_params[0])
-            matched_amount = float(event_params[1])
-            matched_price = float(event_params[2])
-            is_ask = bool(event_params[3])
-            order_time = event_params[4]
-            account = str(event_params[5])
+            maker = str(event_params[0])
+            taker = str(event_params[1])
+            order_id = str(event_params[2])
+            matched_amount = self.safe_decimal_to_float(event_params[3])
+            matched_price = self.safe_decimal_to_float(event_params[4])
+            is_ask = bool(event_params[5])
+            order_time = event_params[6]
+            pair = self.normalize_pair(str(event_params[7]))
             
             timestamp = self.extract_timestamp(order_time)
             
@@ -263,7 +297,11 @@ class DexOrderProcessor:
             # Create trade record
             trade_data = {
                 "orderId": order_id,
-                "account": account,
+                "pair": pair,
+                "maker": maker,
+                "taker": taker,
+                "makerAccount": maker,  # For backward compatibility
+                "takerAccount": taker,  # For backward compatibility
                 "amount": matched_amount,
                 "price": matched_price,
                 "isAsk": is_ask,
@@ -278,7 +316,7 @@ class DexOrderProcessor:
             
             self.trade_inserts.append(trade_data)
             
-            logger.debug(f"Queued MATCH_ORDER update for order {order_id} - matched {matched_amount} @ {matched_price}, status: {new_status}")
+            logger.debug(f"Queued MATCH_ORDER update for order {order_id} - {pair} matched {matched_amount} @ {matched_price} (maker: {maker}, taker: {taker}), status: {new_status}")
             
         except Exception as e:
             logger.error(f"Error processing MATCH_ORDER event: {e}")
@@ -406,6 +444,9 @@ class DexOrderProcessor:
             # Orders collection indexes
             self.orders_collection.create_index("orderId", unique=True)
             self.orders_collection.create_index("account")
+            self.orders_collection.create_index("pair")  # New index for pair
+            self.orders_collection.create_index([("pair", 1), ("price", 1), ("orderType", 1)])  # Updated compound index
+            self.orders_collection.create_index([("pair", 1), ("status", 1), ("orderType", 1), ("price", 1)])  # Updated compound index
             self.orders_collection.create_index([("price", 1), ("orderType", 1)])
             self.orders_collection.create_index([("status", 1), ("orderType", 1), ("price", 1)])
             self.orders_collection.create_index("status")
@@ -416,16 +457,23 @@ class DexOrderProcessor:
             self.orders_collection.create_index("fillPercentage")
             self.orders_collection.create_index([("account", 1), ("status", 1)])
             self.orders_collection.create_index([("account", 1), ("orderType", 1)])
+            self.orders_collection.create_index([("account", 1), ("pair", 1)])  # New compound index
+            self.orders_collection.create_index([("pair", 1), ("account", 1), ("status", 1)])  # New compound index
             
             # Trades collection indexes
             self.trades_collection.create_index("orderId")
             self.trades_collection.create_index("account")
+            self.trades_collection.create_index("pair")  # New index for pair
             self.trades_collection.create_index("tradeTime")
             self.trades_collection.create_index("height")
             self.trades_collection.create_index("txId")
+            self.trades_collection.create_index([("pair", 1), ("tradeTime", -1)])  # New compound index
             self.trades_collection.create_index([("account", 1), ("tradeTime", -1)])
             self.trades_collection.create_index([("orderId", 1), ("tradeTime", -1)])
+            self.trades_collection.create_index([("pair", 1), ("price", 1), ("orderType", 1)])  # Updated compound index
             self.trades_collection.create_index([("price", 1), ("orderType", 1)])
+            self.trades_collection.create_index([("maker", 1), ("pair", 1), ("tradeTime", -1)])  # New compound index
+            self.trades_collection.create_index([("taker", 1), ("pair", 1), ("tradeTime", -1)])  # New compound index
             
             logger.info("Database indexes created successfully")
             
@@ -441,12 +489,20 @@ class DexOrderProcessor:
             partially_filled_orders = self.orders_collection.count_documents({"status": "partially_filled"})
             total_trades = self.trades_collection.count_documents({})
             
+            # Get pair statistics
+            pair_pipeline = [
+                {"$group": {"_id": "$pair", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}}
+            ]
+            pair_stats = list(self.orders_collection.aggregate(pair_pipeline))
+            
             stats = {
                 "total_orders": total_orders,
                 "active_orders": active_orders,
                 "filled_orders": filled_orders,
                 "partially_filled_orders": partially_filled_orders,
-                "total_trades": total_trades
+                "total_trades": total_trades,
+                "orders_by_pair": pair_stats
             }
             
             logger.info(f"Order Statistics: {stats}")
