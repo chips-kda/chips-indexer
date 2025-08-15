@@ -131,12 +131,12 @@ class DexOrderProcessor:
         return True, ""
 
     def validate_match_order_params(self, params):
-        """Validate MATCH_ORDER event parameters"""
+        """Validate MATCH_ORDER event parameters - Updated to handle dollar-value"""
         if not isinstance(params, list):
             return False, f"Expected params to be a list, got {type(params)}"
         
-        if len(params) < 8:
-            return False, f"Expected at least 8 parameters for MATCH_ORDER [maker, taker, id, amount, price, is_ask, order_time, pair], got {len(params)}"
+        if len(params) < 9:
+            return False, f"Expected at least 9 parameters for MATCH_ORDER [maker, taker, id, amount, price, is_ask, order_time, pair, dollar_value], got {len(params)}"
         
         try:
             # Validate parameter types
@@ -148,6 +148,7 @@ class DexOrderProcessor:
             is_ask = bool(params[5])    # boolean
             order_time = params[6]      # time object
             pair = str(params[7])       # pair string
+            dollar_value = self.safe_decimal_to_float(params[8])  # decimal -> float
             
             if not maker:
                 return False, "Maker account cannot be empty"
@@ -161,6 +162,8 @@ class DexOrderProcessor:
                 return False, "Price must be positive"
             if not pair:
                 return False, "Pair cannot be empty"
+            if dollar_value <= 0:
+                return False, "Dollar value must be positive"
                 
         except (ValueError, TypeError) as e:
             return False, f"Invalid parameter types: {e}"
@@ -209,6 +212,7 @@ class DexOrderProcessor:
                 "fillPercentage": 0.0,
                 "averageFillPrice": 0.0,
                 "totalFillValue": 0.0,
+                "totalDollarValue": 0.0,  # New field for tracking dollar value
                 "numberOfFills": 0,
                 "lastFillTime": None,
                 "lastFillHeight": None,
@@ -231,7 +235,7 @@ class DexOrderProcessor:
             logger.error(f"Error processing PLACE_ORDER event: {e}")
 
     def process_match_order_event(self, event_params, height, block_time=None, tx_id=None):
-        """Process MATCH_ORDER event"""
+        """Process MATCH_ORDER event - Updated to handle dollar-value"""
         try:
             maker = str(event_params[0])
             taker = str(event_params[1])
@@ -241,6 +245,7 @@ class DexOrderProcessor:
             is_ask = bool(event_params[5])
             order_time = event_params[6]
             pair = self.normalize_pair(str(event_params[7]))
+            dollar_value = self.safe_decimal_to_float(event_params[8])  # New parameter
             
             timestamp = self.extract_timestamp(order_time)
             
@@ -260,6 +265,10 @@ class DexOrderProcessor:
             current_total_value = existing_order.get('totalFillValue', 0.0)
             new_total_value = current_total_value + (matched_amount * matched_price)
             new_average_fill_price = new_total_value / new_filled_amount if new_filled_amount > 0 else 0.0
+            
+            # Calculate total dollar value
+            current_total_dollar_value = existing_order.get('totalDollarValue', 0.0)
+            new_total_dollar_value = current_total_dollar_value + dollar_value
             
             # Calculate fill percentage
             original_amount = existing_order.get('originalAmount', 0.0)
@@ -281,6 +290,7 @@ class DexOrderProcessor:
                 "fillPercentage": fill_percentage,
                 "averageFillPrice": new_average_fill_price,
                 "totalFillValue": new_total_value,
+                "totalDollarValue": new_total_dollar_value,  # New field
                 "numberOfFills": new_number_of_fills,
                 "lastFillTime": timestamp,
                 "lastFillHeight": height,
@@ -304,6 +314,7 @@ class DexOrderProcessor:
                 "takerAccount": taker,  # For backward compatibility
                 "amount": matched_amount,
                 "price": matched_price,
+                "dollarValue": dollar_value,  # New field for dollar value
                 "isAsk": is_ask,
                 "orderType": "ask" if is_ask else "bid",
                 "tradeTime": timestamp,
@@ -316,7 +327,7 @@ class DexOrderProcessor:
             
             self.trade_inserts.append(trade_data)
             
-            logger.debug(f"Queued MATCH_ORDER update for order {order_id} - {pair} matched {matched_amount} @ {matched_price} (maker: {maker}, taker: {taker}), status: {new_status}")
+            logger.debug(f"Queued MATCH_ORDER update for order {order_id} - {pair} matched {matched_amount} @ {matched_price} (${dollar_value}) (maker: {maker}, taker: {taker}), status: {new_status}")
             
         except Exception as e:
             logger.error(f"Error processing MATCH_ORDER event: {e}")
@@ -455,6 +466,7 @@ class DexOrderProcessor:
             self.orders_collection.create_index("orderTime")
             self.orders_collection.create_index("lastFillTime")
             self.orders_collection.create_index("fillPercentage")
+            self.orders_collection.create_index("totalDollarValue")  # New index for dollar value
             self.orders_collection.create_index([("account", 1), ("status", 1)])
             self.orders_collection.create_index([("account", 1), ("orderType", 1)])
             self.orders_collection.create_index([("account", 1), ("pair", 1)])  # New compound index
@@ -467,6 +479,7 @@ class DexOrderProcessor:
             self.trades_collection.create_index("tradeTime")
             self.trades_collection.create_index("height")
             self.trades_collection.create_index("txId")
+            self.trades_collection.create_index("dollarValue")  # New index for dollar value
             self.trades_collection.create_index([("pair", 1), ("tradeTime", -1)])  # New compound index
             self.trades_collection.create_index([("account", 1), ("tradeTime", -1)])
             self.trades_collection.create_index([("orderId", 1), ("tradeTime", -1)])
@@ -474,6 +487,7 @@ class DexOrderProcessor:
             self.trades_collection.create_index([("price", 1), ("orderType", 1)])
             self.trades_collection.create_index([("maker", 1), ("pair", 1), ("tradeTime", -1)])  # New compound index
             self.trades_collection.create_index([("taker", 1), ("pair", 1), ("tradeTime", -1)])  # New compound index
+            self.trades_collection.create_index([("pair", 1), ("dollarValue", -1)])  # New compound index for dollar value queries
             
             logger.info("Database indexes created successfully")
             
@@ -496,13 +510,24 @@ class DexOrderProcessor:
             ]
             pair_stats = list(self.orders_collection.aggregate(pair_pipeline))
             
+            # Get total dollar volume statistics
+            dollar_volume_pipeline = [
+                {"$group": {
+                    "_id": None, 
+                    "totalDollarVolume": {"$sum": "$dollarValue"},
+                    "avgDollarValue": {"$avg": "$dollarValue"}
+                }}
+            ]
+            dollar_volume_stats = list(self.trades_collection.aggregate(dollar_volume_pipeline))
+            
             stats = {
                 "total_orders": total_orders,
                 "active_orders": active_orders,
                 "filled_orders": filled_orders,
                 "partially_filled_orders": partially_filled_orders,
                 "total_trades": total_trades,
-                "orders_by_pair": pair_stats
+                "orders_by_pair": pair_stats,
+                "dollar_volume_stats": dollar_volume_stats[0] if dollar_volume_stats else {}
             }
             
             logger.info(f"Order Statistics: {stats}")
