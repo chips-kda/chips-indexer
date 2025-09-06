@@ -5,7 +5,7 @@ import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 
-from dex.place_order import process_dex_orders
+from kadena_indexer.dex.main_processor import process_dex_orders
 
 def run_scripts():
     """Run all processing scripts in sequence"""
